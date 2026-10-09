@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>红环战争 · 手机版</title><meta name="theme-color" content="#0b1324"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="红环战争"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="format-detection" content="telephone=no"><link rel="manifest" href="./manifest.webmanifest"><link rel="apple-touch-icon" href="./icons/icon-192.png"></head><body>
+<script id="game-core">
+'use strict';
+(() => {
+const CONFIG = Object.freeze({
+ width:1440, height:860, safe:58, gap:60, minRadius:40, maxRadius:68,
+ minNodes:8, maxNodes:11, initialUnits:18,
+ productionInterval:1.5, restProductionInterval:1.2, fixedStep:1/60, speed:155*2/3*2/3*3/4, launchInterval:1.2,
+ maxFrameDelta:0.25,
+ difficulties:{
+  easy:{level:0,interval:4.8,reserve:8,actions:1,aggression:0.65,worldWidth:1440,minNodes:8,maxNodes:11,gap:60,minRadius:40,maxRadius:68},
+  standard:{level:1,interval:2.4,reserve:4,actions:1,aggression:1.1,worldWidth:1440,minNodes:12,maxNodes:15,gap:38,minRadius:34,maxRadius:58},
+  hard:{level:3,interval:0.8,reserve:3,actions:1,aggression:1.65,worldWidth:2160,minNodes:28,maxNodes:34,gap:18,minRadius:28,maxRadius:48}
+ }
+});
+const TIMING_OPTIONS=Object.freeze([1,1.2,1.5,1.8,2]);
+function seedNumber(seed){let h=2166136261;for(const c of String(seed)){h^=c.charCodeAt(0);h=Math.imul(h,16777619);}return h>>>0;}
+function rng(seed){let a=seedNumber(seed);return () => {a+=0x6D2B79F5;let t=a;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return ((t^t>>>14)>>>0)/4294967296;};}
+function generateMap(seed,difficulty='easy'){
+ const profile=CONFIG.difficulties[difficulty]||CONFIG.difficulties.easy;
+ const worldWidth=profile.worldWidth||CONFIG.width,random=rng(seed+'|map|'+difficulty),count=profile.minNodes+Math.floor(random()*(profile.maxNodes-profile.minNodes+1));
+ let nodes=[];
+ for(let attempt=0;attempt<20;attempt++){
+  nodes=[];
+  for(let i=0;i<count;i++){
+   let candidate=null;
+   for(let j=0;j<1200;j++){
+    const r=profile.minRadius+random()*(profile.maxRadius-profile.minRadius);
+    const x=CONFIG.safe+r+random()*(worldWidth-2*(CONFIG.safe+r));
+    const y=CONFIG.safe+r+random()*(CONFIG.height-2*(CONFIG.safe+r));
+    if(nodes.every(n=>Math.hypot(n.x-x,n.y-y)>=n.r+r+profile.gap)){candidate={x,y,r};break;}
+   }
+   if(!candidate)break;
+   nodes.push(candidate);
+  }
+  if(nodes.length===count)break;
+ }
+ // Bounded rejection sampling; a difficulty-aware grid fallback avoids hangs.
+ if(nodes.length!==count){
+  const usableW=worldWidth-2*CONFIG.safe,usableH=CONFIG.height-2*CONFIG.safe;
+  const cols=Math.ceil(Math.sqrt(count*usableW/usableH)),rows=Math.ceil(count/cols),cellW=usableW/cols,cellH=usableH/rows;
+  const allowed=Math.max(12,(Math.min(cellW,cellH)-profile.gap)/2-1),radius=Math.min(profile.maxRadius,allowed);
+  nodes=Array.from({length:count},(_,i)=>({x:CONFIG.safe+(i%cols+.5)*cellW,y:CONFIG.safe+(Math.floor(i/cols)+.5)*cellH,r:Math.max(12,Math.min(radius,profile.minRadius+(i%3)*2))}));
+ }
+ nodes.sort((a,b)=>a.x-b.x);
+ nodes.forEach((n,i)=>Object.assign(n,{id:i,capacity:Math.floor(n.r*0.56),units:0,reservedUnits:0,owner:null,routeTargetId:null,productionActive:false,productionClock:0,nextLaunchAt:0,attackers:{white:0,blue:0},attackerSince:{white:null,blue:null}}));
+ const initial=Math.min(CONFIG.initialUnits,nodes[0].capacity,nodes[count-1].capacity);
+ Object.assign(nodes[0],{owner:'white',units:initial});
+ Object.assign(nodes[count-1],{owner:'blue',units:initial});
+ return nodes;
+}
+class Game {
+ constructor(seed,difficulty='easy'){
+  this.seed=String(seed);this.difficulty=CONFIG.difficulties[difficulty]?difficulty:'easy';this.worldWidth=CONFIG.difficulties[this.difficulty].worldWidth||CONFIG.width;this.nodes=generateMap(seed,this.difficulty);
+  this.ratio=.5;this.state='running';this.winner=null;this.time=0;
+   this.mobile=[];this.events=[];this.serial=0;this.aiClock=0;this.aiRandom=rng('ai:'+seed);
+   this.whiteCapitalId=this.nodes.find(n=>n.owner==='white')?.id??null;this.blueCapitalId=this.nodes.find(n=>n.owner==='blue')?.id??null;
+   this.aiPlan={type:'opening',sourceId:null,targetId:null,time:0,score:0};
+   Object.defineProperty(this,'productionClock',{enumerable:true,get:()=>Math.max(0,...this.nodes.map(n=>n.productionClock||0)),set:value=>{value=Number.isFinite(Number(value))?Math.max(0,Number(value)):0;for(const n of this.nodes)n.productionClock=value;}});this.productionClock=0;
+   this.productionInterval=CONFIG.productionInterval;this.launchInterval=CONFIG.launchInterval;
+  }
+ emit(type,node,team){this.events.push({type,x:node.x,y:node.y,r:node.r,team,time:this.time});if(this.events.length>100)this.events.shift();}
+ arrive(nodeId,team){
+  const target=this.nodes.find(n=>n.id===nodeId);if(!target)return;
+  if(target.owner===null){target.owner=team;target.units=1;target.productionActive=false;target.productionClock=0;target.nextLaunchAt=this.time;this.emit('capture',target,team);return;}
+  if(target.owner===team){
+   // Friendly overflow never enters the garrison: excess reinforcements disband.
+   target.units=Math.min(target.capacity,target.units+1);return;
+  }
+  // One attacker and one defender are both consumed.
+  target.productionActive=false;
+  target.units--;this.emit('hit',target,team);
+  if(target.units<=0){const oldOwner=target.owner;this.purgeReservations(target.id,oldOwner);target.owner=null;target.units=0;target.reservedUnits=0;target.routeTargetId=null;target.productionActive=false;target.productionClock=0;target.nextLaunchAt=this.time;target.attackers={blue:0,white:0};target.attackerSince={blue:null,white:null};this.emit('neutralized',target,team);}
+ }
+ pause(value){if(this.state!=='ended')this.state=value?'paused':'running';return this.state;}
+ setTiming(kind,value){
+  value=Number(value);if(!TIMING_OPTIONS.includes(value)||!['production','launch'].includes(kind))return false;
+  if(kind==='production'){
+   const old=this.productionInterval;this.productionInterval=value;
+   if(old>0)for(const n of this.nodes)if(!this.isResting(n))n.productionClock=Math.min(value-1e-9,(n.productionClock||0)/old*value);
+   return true;
+  }
+  this.launchInterval=value;
+  for(const source of this.nodes){
+   const waiting=this.mobile.filter(u=>u.sourceId===source.id&&u.reserved===true).sort((a,b)=>a.delay-b.delay||a.id-b.id);
+   waiting.forEach((u,i)=>u.delay=(i+1)*value);
+   source.nextLaunchAt=this.time+waiting.length*value;
+  }
+  return true;
+ }
+ isResting(node){
+  if(!node||!node.owner||node.routeTargetId!==null||(node.reservedUnits||0)>0)return false;
+  const enemy=node.owner==='blue'?'white':'blue';
+  return (node.attackers[enemy]||0)===0;
+ }
+ productionIntervalFor(node){return this.isResting(node)?CONFIG.restProductionInterval:this.productionInterval;}
+
+ issueOrder(sourceId,targetId,ratio=this.ratio){
+  if(![.25,.5,1].includes(ratio))return {ok:false,reason:'发送比例无效'};
+  const source=this.nodes.find(n=>n.id===sourceId);
+  if(!source||source.owner!=='blue')return {ok:false,reason:'请选择蓝方据点'};
+  const target=this.nodes.find(n=>n.id===targetId);
+  if(this.state!=='running'||!target||source===target)return {ok:false,reason:'指令目标无效或战局已暂停'};
+  source.routeTargetId=targetId;
+  const redirected=this.redirectWaiting(sourceId,targetId,'blue');
+  if(source.units<=1)return {ok:true,sent:0,redirected};
+  const result=this.dispatch(sourceId,targetId,Math.min(source.units-1,Math.max(1,Math.floor(source.units*ratio))),'blue');
+  result.redirected=redirected;return result;
+  }
+ firstContact(s,t){
+  const dx=t.x-s.x,dy=t.y-s.y,len=Math.hypot(dx,dy),ux=dx/len,uy=dy/len;
+  const sx=s.x+ux*(s.r+5),sy=s.y+uy*(s.r+5),vx=t.x-sx,vy=t.y-sy,a=vx*vx+vy*vy;
+  let best=null;
+  for(const n of this.nodes){
+   if(n===s)continue;
+   const radius=n.r+4.1,fx=sx-n.x,fy=sy-n.y,b=2*(fx*vx+fy*vy),c=fx*fx+fy*fy-radius*radius,disc=b*b-4*a*c;
+   if(disc<0)continue;
+   const root=(-b-Math.sqrt(disc))/(2*a);
+   if(root>=0&&root<=1&&(!best||root<best.root))best={node:n,root};
+  }
+  if(!best){const distance=Math.max(1,Math.hypot(t.x-sx,t.y-sy));return {node:t,sx,sy,tx:t.x,ty:t.y,distance};}
+  const tx=sx+vx*best.root,ty=sy+vy*best.root;
+  return {node:best.node,sx,sy,tx,ty,distance:Math.max(1,Math.hypot(tx-sx,ty-sy))};
+  }
+  redirectWaiting(sourceId,targetId,team){
+  const s=this.nodes.find(n=>n.id===sourceId),t=this.nodes.find(n=>n.id===targetId);
+  if(!s||!t||s===t)return 0;
+  const hit=this.firstContact(s,t);let count=0;
+  for(const u of this.mobile){
+   // Only balls that have not launched may change course. Preserve their delay,
+   // so rerouting cannot collapse the currently selected launch cadence.
+   if(u.sourceId!==sourceId||u.team!==team||u.reserved!==true)continue;
+   Object.assign(u,{targetId:hit.node.id,sx:hit.sx,sy:hit.sy,tx:hit.tx,ty:hit.ty,distance:hit.distance,intendedTargetId:t.id});count++;
+  }
+  return count;
+  }
+  stopRoute(sourceId,team='blue'){
+  const source=this.nodes.find(n=>n.id===sourceId);
+  if(!source||source.owner!==team)return {ok:false,reason:'只能停止己方红环输送'};
+  source.routeTargetId=null;
+  let cancelled=0,active=0;const remaining=[];
+  for(const u of this.mobile){
+   if(u.sourceId===sourceId&&u.team===team&&u.reserved===true){cancelled++;continue;}
+   if(u.sourceId===sourceId&&u.team===team)active++;
+   remaining.push(u);
+  }
+  this.mobile=remaining;source.reservedUnits=Math.max(0,(source.reservedUnits||0)-cancelled);source.nextLaunchAt=this.time;
+  return {ok:true,cancelled,active};
+  }
+  purgeReservations(sourceId,team){
+  const source=this.nodes.find(n=>n.id===sourceId);let removed=0;
+  this.mobile=this.mobile.filter(u=>{if(u.sourceId===sourceId&&u.team===team&&u.reserved===true){removed++;return false;}return true;});
+  if(source)source.reservedUnits=Math.max(0,(source.reservedUnits||0)-removed);
+  return removed;
+  }
+  dispatch(sourceId,targetId,count,team){
+  const s=this.nodes.find(n=>n.id===sourceId),t=this.nodes.find(n=>n.id===targetId);
+  if(this.state!=='running')return {ok:false,reason:'当前战局已暂停或结束'};
+  if(!s||!t||s===t||s.owner!==team)return {ok:false,reason:'指令目标无效'};
+  const amount=Math.min(s.units-(s.reservedUnits||0)-1,Math.floor(count));
+  if(!Number.isFinite(amount)||amount<1)return {ok:false,reason:'至少需要 2 球，留 1 球守家'};
+  const hit=this.firstContact(s,t);
+  const ready=Math.max(this.time,Number.isFinite(s.nextLaunchAt)?s.nextLaunchAt:this.time),firstDelay=ready-this.time;
+  // Waiting balls remain part of the source count. Deduct only when movement begins.
+  for(let i=0;i<amount;i++){
+   const delay=firstDelay+i*this.launchInterval,reserved=delay>1e-9;
+   if(reserved)s.reservedUnits=(s.reservedUnits||0)+1;else s.units--;
+   this.mobile.push({id:++this.serial,team,sourceId:s.id,targetId:hit.node.id,sx:hit.sx,sy:hit.sy,tx:hit.tx,ty:hit.ty,distance:hit.distance,progress:0,delay,intendedTargetId:t.id,reserved});
+  }
+  s.nextLaunchAt=ready+amount*this.launchInterval;
+  return {ok:true,sent:amount};
+ }
+ totals(){
+  const result={white:{nodes:0,garrison:0,mobile:0,attackers:0,total:0},blue:{nodes:0,garrison:0,mobile:0,attackers:0,total:0}};
+  for(const n of this.nodes){if(n.owner){result[n.owner].nodes++;result[n.owner].garrison+=n.units;}for(const team of ['white','blue'])result[team].attackers+=n.attackers[team];}
+  for(const u of this.mobile)if(u.reserved!==true)result[u.team].mobile++;
+  for(const team of ['white','blue']){const r=result[team];r.total=r.garrison+r.mobile+r.attackers;}
+  return result;
+ }
+ resolveOrphanAttackers(){
+  let changed=false;
+  for(const team of ['blue','white']){
+   const hasNode=this.nodes.some(n=>n.owner===team&&n.units>0);
+   const hasMobile=this.mobile.some(u=>u.team===team);
+   if(hasNode||hasMobile)continue;
+   for(const n of this.nodes)if(n.attackers[team]>0){n.attackers[team]=0;if(n.attackerSince)n.attackerSince[team]=null;this.emit('retreat',n,team);changed=true;}
+  }
+  return changed;
+ }
+
+ resolveLastStand(){
+  if(this.mobile.length!==0)return false;
+  const occupied=this.nodes.filter(n=>n.owner!==null);
+  if(occupied.length<1)return false;
+  const teams=new Set();
+  for(const n of occupied){
+   teams.add(n.owner);
+   for(const team of ['blue','white'])if(n.attackers[team]>0)teams.add(team);
+  }
+  if(teams.size!==2)return false;
+  const locked=occupied.every(n=>{
+   const enemy=n.owner==='blue'?'white':'blue';
+   return n.units===1&&n.attackers[enemy]===1&&n.attackers[n.owner]===0;
+  });
+  if(!locked)return false;
+  for(const n of occupied){
+   const attacker=n.owner==='blue'?'white':'blue';
+   this.purgeReservations(n.id,n.owner);n.owner=null;n.units=0;n.reservedUnits=0;n.routeTargetId=null;n.productionActive=false;n.productionClock=0;n.attackers={blue:0,white:0};n.attackerSince={blue:null,white:null};
+   this.emit('laststand',n,attacker);
+  }
+  return true;
+ }
+ checkVictory(){
+  const totals=this.totals();
+  const whiteGone=totals.white.total===0,blueGone=totals.blue.total===0;
+  if(!whiteGone&&!blueGone)return;
+  this.winner=whiteGone===blueGone?null:(whiteGone?'blue':'white');
+  this.state='ended';
+ }
+ decideAI(){
+  const preset=CONFIG.difficulties[this.difficulty]||CONFIG.difficulties.standard;
+  const sources=this.nodes.filter(n=>n.owner==='white'),blueNodes=this.nodes.filter(n=>n.owner==='blue'),neutralNodes=this.nodes.filter(n=>n.owner===null);
+  const opening=this.time<75&&neutralNodes.length>0;
+  const hard=this.difficulty==='hard';
+  const aimedAt=(u,targetId)=>u.team==='white'&&(u.intendedTargetId===targetId||u.targetId===targetId);
+  // Hard doctrine treats rings as terrain. A ring that is the first contact
+  // on several routes is a chokepoint even when its capacity is modest.
+  const terrain=new Map();
+  for(const candidate of this.nodes){
+   let cut=0;
+   if(hard)for(const ally of sources)for(const enemy of blueNodes){
+    if(candidate===ally||candidate===enemy)continue;
+    if(this.firstContact(ally,enemy).node===candidate)cut++;
+   }
+   const reach=this.nodes.filter(n=>n!==candidate&&Math.hypot(n.x-candidate.x,n.y-candidate.y)<430).length;
+   terrain.set(candidate.id,{cut,reach,value:Math.min(5,cut)*28+Math.min(8,reach)*2});
+  }
+  let best=null;
+  for(const source of sources){
+   const danger=this.mobile.filter(u=>u.team==='blue'&&u.targetId===source.id).length+source.attackers.blue;
+   const reserve=Math.max(3,preset.reserve,Math.min(source.units-2,danger+2));
+   const available=Math.max(0,source.units-(source.reservedUnits||0)-reserve);
+   for(const target of this.nodes){
+    if(target===source)continue;
+    const distance=Math.hypot(target.x-source.x,target.y-source.y);
+    const ours=this.mobile.filter(u=>aimedAt(u,target.id)).length;
+    const theirs=this.mobile.filter(u=>u.team==='blue'&&u.targetId===target.id).length;
+    const committed=sources.filter(n=>n!==source&&n.routeTargetId===target.id);
+    let score=-Infinity,amount=0,strategy='hold';
+    if(target.owner===null){
+     // Opening doctrine: spread across neutral territory instead of stacking
+     // multiple routes on one empty ring. A source that cannot launch now must
+     // not consume the opening decision; outside the opening it may pre-route.
+     if(opening&&available<1)continue;
+     if(ours>0||committed.length>0)continue;
+     amount=Math.min(available,opening?3:Math.max(3,Math.floor(target.capacity*.23)));
+     score=(opening?235:82)+target.capacity*.8-distance*(opening?.11:.10)-theirs*(opening?1:3);
+     if(source.routeTargetId===null)score+=12;
+     strategy='expand';
+     if(hard){const ground=terrain.get(target.id);score+=ground.value;if(ground.cut>=2)strategy='chokepoint';}
+    }else if(target.owner==='blue'){
+     // Estimate only from current visible defenders / travel time / known production.
+     const travel=distance/CONFIG.speed;
+     const need=target.units+theirs+Math.ceil(travel/this.productionIntervalFor(target))+2-target.attackers.white-ours;
+     if(ours>=target.units+8)continue;
+     amount=Math.min(available,Math.max(4,need+2));
+     score=44+target.capacity*.45-distance*.055-target.units*1.2;
+     score+=(available+ours-target.units)*1.1*preset.aggression;
+     if(available+ours<need)score-=hard?80:35;
+     strategy='attack';
+     if(hard){
+      const attacksWhite=target.routeTargetId!==null&&this.nodes.find(n=>n.id===target.routeTargetId)?.owner==='white';
+      const feedsAttack=attacksWhite||this.mobile.some(u=>u.team==='blue'&&u.sourceId===target.id&&this.nodes.find(n=>n.id===u.targetId)?.owner==='white');
+      if(feedsAttack){score+=160;strategy='counterattack';}
+      score+=terrain.get(target.id).value*.35;
+     }
+     if(committed.length>0){
+      // "Encirclement" first means several source rings converging on one
+      // objective. Bearing diversity is only a modest secondary advantage;
+      // strength and travel distance must still decide clearly better sources.
+      const angle=Math.atan2(source.y-target.y,source.x-target.x);
+      let separation=0;
+      for(const ally of committed){const a=Math.atan2(ally.y-target.y,ally.x-target.x),raw=Math.abs(angle-a)%(Math.PI*2);separation=Math.max(separation,Math.min(raw,Math.PI*2-raw));}
+      score+=64*committed.length+Math.min(36,ours*3)+separation/Math.PI*12;
+      strategy='encircle';
+     }
+     const weakLimit=Math.max(3,Math.floor(target.capacity*.28));
+     const clearRaid=target.id===this.blueCapitalId&&distance>=400&&target.units<=weakLimit&&this.firstContact(source,target).node===target;
+     if(clearRaid){score+=135+(weakLimit-target.units)*7+Math.min(30,distance*.02);strategy='raid';}
+    }else{
+     const threat=theirs+target.attackers.blue;
+     const stabilizeNeed=Math.max(0,3-target.units-ours);
+     if(stabilizeNeed>0){
+      if(available<1)continue;
+      amount=Math.min(available,stabilizeNeed);
+      score=330+(3-target.units)*18+available*.5-distance*.06;
+      strategy='stabilize';
+      score+=this.aiRandom()*2;
+      if(!best||score>best.score)best={source,target,score,amount,strategy};
+      continue;
+     }
+     const shortage=target.capacity-target.units-ours;
+     if(shortage<3)continue;
+     const blueDistance=Math.min(...blueNodes.map(n=>Math.hypot(n.x-target.x,n.y-target.y)),2000);
+     const sourceDistance=Math.min(...blueNodes.map(n=>Math.hypot(n.x-source.x,n.y-source.y)),2000);
+     if(threat<=target.units&&blueDistance>=sourceDistance-80)continue;
+     amount=Math.min(available,shortage,Math.max(3,Math.ceil(available*.6)));
+     score=10+Math.max(0,threat-target.units)*3-distance*.05+(sourceDistance-blueDistance)*.04;
+     strategy='reinforce';
+    }
+    if(hard&&source.routeTargetId!==null){
+     // Keep a viable lane unless the new plan wins by a clear margin.
+     score+=source.routeTargetId===target.id?42:-42;
+    }
+    score+=this.aiRandom()*2;
+    if(!best||score>best.score)best={source,target,score,amount,strategy};
+   }
+  }
+  if(!best||best.score<=-15){this.aiPlan={type:'hold',sourceId:null,targetId:null,time:this.time,score:best?.score??-Infinity};return;}
+  best.source.routeTargetId=best.target.id;this.redirectWaiting(best.source.id,best.target.id,'white');
+  if(best.amount>0)this.dispatch(best.source.id,best.target.id,best.amount,'white');
+  this.aiPlan={type:best.strategy,sourceId:best.source.id,targetId:best.target.id,time:this.time,score:Math.round(best.score*100)/100,...(hard?{doctrine:'hard-v2'}:{})};
+ }
+ step(dt){
+  if(this.state!=='running'||!Number.isFinite(dt)||dt<=0)return;
+  this.time+=dt;
+  // Enemy damage may make old reservations exceed the surviving garrison.
+  // Trim the latest unlaunched balls immediately for both teams; otherwise a
+  // blue ring can display enough balls while spending many launch intervals
+  // cancelling an impossible old queue instead of actually firing.
+  for(const source of this.nodes){
+   if(!source.owner)continue;
+   const floor=source.owner==='white'?3:1,projected=source.units-(source.reservedUnits||0);
+   if(projected>=floor)continue;
+   const need=floor-projected,team=source.owner;
+   const waiting=this.mobile.filter(u=>u.sourceId===source.id&&u.team===team&&u.reserved===true).sort((a,b)=>b.delay-a.delay||b.id-a.id);
+   const cancel=new Set(waiting.slice(0,need));
+   if(cancel.size){
+    this.mobile=this.mobile.filter(u=>!cancel.has(u));source.reservedUnits=Math.max(0,(source.reservedUnits||0)-cancel.size);
+    const remaining=this.mobile.filter(u=>u.sourceId===source.id&&u.team===team&&u.reserved===true);
+    source.nextLaunchAt=remaining.length?this.time+Math.max(...remaining.map(u=>Math.max(0,u.delay-dt)))+this.launchInterval:this.time;
+   }
+  }
+  // Release reservations that begin moving in this step before production.
+  // This lets a same-cadence production pulse refill the just-opened slot.
+  const dead=new Set();
+  for(const u of this.mobile){
+   if(u.reserved!==true||Math.max(0,u.delay)>dt+1e-9)continue;
+   const source=this.nodes.find(n=>n.id===u.sourceId);if(source)source.reservedUnits=Math.max(0,(source.reservedUnits||0)-1);
+   const floor=u.team==='white'?3:1;
+   if(!source||source.owner!==u.team||source.units-(source.reservedUnits||0)<=floor){dead.add(u);continue;}
+   source.units--;u.reserved=false;
+  }
+  // Each ring keeps its own time since the last production pulse.
+  for(const n of this.nodes){
+   if(!n.owner){n.productionActive=false;n.productionClock=0;continue;}
+   const enemy=n.owner==='blue'?'white':'blue';
+   if(n.attackers[enemy]>0){n.productionActive=false;n.productionClock=0;continue;}
+   if(!n.productionActive){if(n.units<=3){n.productionClock=0;continue;}n.productionActive=true;}
+   n.productionClock=(n.productionClock||0)+dt;
+   const interval=this.productionIntervalFor(n);
+   while(n.productionClock+1e-9>=interval){
+    n.productionClock-=interval;
+    if(n.units<n.capacity){n.units++;if(n.routeTargetId!==null&&n.units>(n.owner==='white'?3:1))this.dispatch(n.id,n.routeTargetId,1,n.owner);}
+   }
+  }
+  // Sweep moving disks in shared time, including launch and arrival boundaries.
+  // Broad phase: swept bounding boxes in a spatial grid. Narrow phase: relative motion.
+  const grid=new Map(), hits=[], radius=8.2, cell=32;
+  for(const u of this.mobile){
+   if(dead.has(u))continue;
+   const start=Math.max(0,u.delay), duration=(1-u.progress)*u.distance/CONFIG.speed;
+   const end=Math.min(dt,start+duration);
+   const vx=(u.tx-u.sx)*CONFIG.speed/u.distance,vy=(u.ty-u.sy)*CONFIG.speed/u.distance;
+   const x=u.sx+(u.tx-u.sx)*u.progress,y=u.sy+(u.ty-u.sy)*u.progress;
+   const a={u,start,end,vx,vy,x,y};
+   const active=Math.max(0,dt-start);u.delay=Math.max(0,u.delay-dt);
+   u.progress=Math.min(1,u.progress+active*CONFIG.speed/u.distance);
+   if(start>=dt||end<start)continue;
+   const ex=x+vx*(end-start),ey=y+vy*(end-start),checked=new Set();
+   for(let gx=Math.floor((Math.min(x,ex)-radius)/cell);gx<=Math.floor((Math.max(x,ex)+radius)/cell);gx++){
+    for(let gy=Math.floor((Math.min(y,ey)-radius)/cell);gy<=Math.floor((Math.max(y,ey)+radius)/cell);gy++){
+     const key=gx+','+gy,bucket=grid.get(key)||[];
+     for(const b of bucket){
+      if(b.u.team===u.team||checked.has(b))continue;checked.add(b);
+      const lo=Math.max(start,b.start),hi=Math.min(end,b.end);if(lo>hi)continue;
+      const dx=x+vx*(lo-start)-b.x-b.vx*(lo-b.start),dy=y+vy*(lo-start)-b.y-b.vy*(lo-b.start);
+      const rx=vx-b.vx,ry=vy-b.vy,A=rx*rx+ry*ry,B=2*(dx*rx+dy*ry),C=dx*dx+dy*dy-radius*radius;
+      let t=0;
+      if(C>0){const disc=B*B-4*A*C;if(A===0||disc<0)continue;t=(-B-Math.sqrt(disc))/(2*A);if(t<0||t>hi-lo)continue;}
+      hits.push({a,b,t:lo+t});
+     }
+     bucket.push(a);grid.set(key,bucket);
+    }
+   }
+  }
+  hits.sort((a,b)=>a.t-b.t);
+  for(const hit of hits){
+   const {a,b,t}=hit;if(dead.has(a.u)||dead.has(b.u))continue;
+   dead.add(a.u);dead.add(b.u);
+   this.emit('midair',{x:(a.x+a.vx*(t-a.start)+b.x+b.vx*(t-b.start))/2,y:(a.y+a.vy*(t-a.start)+b.y+b.vy*(t-b.start))/2,r:4.1},'blue');
+  }
+  const remaining=[];
+  for(const u of this.mobile){if(dead.has(u))continue;if(u.progress>=1)this.arrive(u.targetId,u.team);else remaining.push(u);}
+  this.mobile=remaining;
+  this.aiClock+=dt;
+  const interval=(CONFIG.difficulties[this.difficulty]||CONFIG.difficulties.standard).interval;
+  if(this.aiEnabled!==false&&this.aiClock>=interval){this.aiClock%=interval;this.decideAI();}
+  this.resolveOrphanAttackers();
+  this.resolveLastStand();
+  this.checkVictory();
+ }
+ snapshot(){return JSON.parse(JSON.stringify({seed:this.seed,worldWidth:this.worldWidth,nodes:this.nodes,mobile:this.mobile,units:this.totals(),state:this.state,winner:this.winner,time:this.time,difficulty:this.difficulty,ratio:this.ratio,productionClock:this.productionClock,productionInterval:this.productionInterval,restProductionInterval:CONFIG.restProductionInterval,launchInterval:this.launchInterval,whiteCapitalId:this.whiteCapitalId,blueCapitalId:this.blueCapitalId,aiPlan:this.aiPlan}));}
+}
+globalThis.RedRingCore={Game,CONFIG,TIMING_OPTIONS};
+})();
+</script>
+<style>
+.map-scroll{position:absolute;left:50%;bottom:8px;z-index:5;width:min(620px,64%);height:22px;transform:translateX(-50%);accent-color:#65caff;cursor:ew-resize;filter:drop-shadow(0 2px 5px #000)}.map-scroll[hidden]{display:none!important}
+:root{color-scheme:dark;--blue:#67caff;--red:#ff3768;--muted:#8193ac}*{box-sizing:border-box}body{margin:0;background:#060c19;color:#e4efff;font:14px system-ui,'Microsoft YaHei',sans-serif;height:100dvh;display:flex;flex-direction:column;overflow:hidden}header{padding:18px 26px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #213049;background:#0b1324}h1{margin:0;font-size:22px;letter-spacing:4px}small{font-size:10px;color:var(--muted);letter-spacing:3px}.stats{display:flex;gap:24px;font-variant-numeric:tabular-nums}.blue{color:var(--blue)}.white{color:#eef5ff}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:12px 26px;background:#0b1324}button,select{background:#131f34;border:1px solid #30415a;border-radius:7px;padding:9px 13px;color:#b9cae1;font:inherit;cursor:pointer}button:hover,button:focus-visible{border-color:var(--blue);color:white}button.active{background:#143d59;border-color:#67caff;color:#c9f0ff}button:disabled{opacity:.4;cursor:default}.divider{width:1px;height:22px;background:#30415a;margin:0 5px}.timing-panel{display:flex;gap:28px;align-items:center;padding:6px 26px 8px;background:#091221;border-top:1px solid #18263a;border-bottom:1px solid #213049}.timing-control{display:grid;grid-template-columns:auto 54px minmax(130px,220px);align-items:center;gap:8px;color:#9eb0c8;font-size:12px}.timing-control output{color:#e4efff;font-variant-numeric:tabular-nums}.timing-control input{accent-color:var(--blue);cursor:pointer;width:100%}#stage{position:relative;flex:1;min-height:0}canvas{width:100%;height:100%;display:block;touch-action:none}footer{padding:10px 26px 14px;display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px;background:#0b1324}#message{color:#b6d9ef}.overlay{position:absolute;inset:0;background:#030915c9;backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;z-index:10}.overlay[hidden]{display:none}.card{width:min(520px,92%);max-height:92%;overflow:auto;padding:30px;border:1px solid #33425d;border-radius:16px;background:linear-gradient(145deg,#15233a,#0a1120);box-shadow:0 25px 100px #0008}.card h2{font-size:30px;margin:0 0 14px}.card p{line-height:1.8;color:#b6c6dc}.eyebrow{color:var(--red);font-size:11px;letter-spacing:4px;margin-bottom:12px}.start-actions{display:flex;flex-direction:column;align-items:center;gap:12px;margin-top:22px}.start-actions button{width:min(260px,100%);min-height:50px;font-size:16px;font-weight:800;letter-spacing:.12em}.start-actions #startGame{color:#fff;border-color:var(--red);background:#6f1730}.start-actions #startHelp{color:#d9edff;border-color:#4a6788;background:#14243a}#pauseTag{position:absolute;top:15px;left:50%;transform:translateX(-50%);padding:8px 20px;background:#132039d9;border:1px solid #456080;border-radius:30px;pointer-events:none}#pauseTag[hidden]{display:none}@media(max-width:650px){header{padding:12px 14px;align-items:flex-start}h1{font-size:17px;letter-spacing:2px}.stats{gap:10px;font-size:11px}.toolbar{padding:8px 12px;gap:5px}button,select{padding:8px;font-size:12px}.divider{display:none}.timing-panel{padding:4px 8px;gap:3px;flex-direction:column;align-items:stretch}.timing-control{grid-template-columns:62px 42px minmax(0,1fr)}footer{padding:8px 12px;font-size:10px}#seedLabel{display:none}small{font-size:8px;letter-spacing:1px}}
+.card.outcome-card{width:min(760px,94%);text-align:center;overflow:hidden;position:relative;border-width:2px;isolation:isolate}.card.outcome-card::before{content:"";position:absolute;inset:-40%;z-index:-1;background:repeating-conic-gradient(from 0deg,#65caff22 0 8deg,transparent 8deg 18deg);animation:impactSpin 7s linear infinite}.card h2.outcome-impact{pointer-events:none;font-size:clamp(58px,11vw,120px)!important;line-height:.95;margin:8px 0 18px;letter-spacing:.14em;text-indent:.14em;font-weight:1000;animation:impactIn .55s cubic-bezier(.2,1.35,.3,1),impactPulse 1.25s ease-in-out .65s infinite alternate}.outcome-impact.victory{color:#79dcff;text-shadow:0 0 12px #65caff,0 0 38px #178bd9,0 8px 0 #0b4775}.outcome-impact.defeat{color:#ff678a;text-shadow:0 0 12px #ff3768,0 0 38px #b40035,0 8px 0 #68132b}.outcome-impact.draw{color:#f3f7ff;text-shadow:0 0 12px #fff,0 0 38px #8394b8,0 8px 0 #35405a}.outcome-subtitle{font-size:18px;letter-spacing:.55em;text-indent:.55em;color:#d5e5fa}.card.help-card{width:min(680px,94%);padding:26px 30px}.card.help-card h2{font-weight:800;letter-spacing:.12em}.help-list{list-style:none;margin:12px 0 20px;padding:0;display:grid;gap:9px;color:#d5e4f6;font-size:15px;font-weight:650;line-height:1.72;letter-spacing:.04em}.help-list li{padding-left:1.15em;position:relative}.help-list li::before{content:"•";position:absolute;left:0;color:var(--blue)}.help-list strong{color:#fff;font-weight:800}@keyframes impactIn{0%{opacity:0;transform:scale(.68);filter:blur(10px)}70%{opacity:1;transform:scale(1.02);filter:blur(0)}100%{transform:scale(1)}}@keyframes impactPulse{to{transform:scale(1.025);filter:brightness(1.18)}}@keyframes impactSpin{to{transform:rotate(1turn)}}@media(max-height:520px){.card.outcome-card{padding:12px 22px}.card.outcome-card .eyebrow{margin-bottom:4px}.card h2.outcome-impact{font-size:clamp(46px,8vw,78px)!important;line-height:.9;margin:2px 0 6px}.outcome-subtitle{font-size:14px;margin:4px 0 8px}.card.outcome-card button{padding:7px 12px}}
+.outcome-actions{display:grid;grid-template-columns:repeat(2,minmax(140px,1fr));gap:10px;margin:14px auto 0;max-width:430px}.outcome-actions button{min-height:46px;font-weight:800}.outcome-actions #nextLevel{border-color:var(--blue);color:#e7f8ff;background:#133852}.outcome-actions #increaseDifficulty{border-color:#ff9b55;color:#ffe0ca;background:#4a2818}@media(max-width:480px){.outcome-actions{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.outcome-actions button{min-width:0}}@media(max-height:520px){.outcome-actions{margin-top:6px;gap:6px}.outcome-actions button{min-height:40px;padding:5px 8px}}
+
+html{height:100%;overflow:hidden;overscroll-behavior:none;touch-action:manipulation}
+body{height:var(--app-height,100dvh);width:100%;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);overscroll-behavior:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+header{padding:4px 10px;min-height:34px;gap:6px;flex-shrink:0}h1{font-size:15px;letter-spacing:2px}header small{display:none}.stats{gap:12px;font-size:12px;white-space:nowrap}
+.toolbar{padding:3px 8px;gap:5px;flex-wrap:nowrap;flex-shrink:0;min-width:0;position:relative;z-index:3}button,select,summary{min-width:44px;min-height:44px;padding:6px 10px;font-size:13px;touch-action:manipulation}summary{display:flex;align-items:center;justify-content:center;cursor:pointer;border:1px solid #30415a;border-radius:7px;background:#131f34;list-style:none}summary::-webkit-details-marker{display:none}.toolbar .divider{display:none}.toolbar>span{font-size:11px}#more{margin-left:auto}#more[open]>summary{border-color:#67caff}.more-panel{position:absolute;right:8px;top:100%;display:grid;grid-template-columns:repeat(3,minmax(70px,1fr));gap:7px;padding:10px;background:#0b1324f5;border:1px solid #30415a;border-radius:10px;box-shadow:0 12px 30px #0008;max-width:calc(100vw - 16px)}.timing-wrap{display:flex;flex-direction:column;align-items:flex-start;flex-shrink:0;background:#091221;border-top:1px solid #18263a;border-bottom:1px solid #213049}.timing-wrap #timingToggle{min-width:96px;min-height:44px;margin:3px 8px 2px;padding:5px 10px;font-size:11px}.timing-panel{width:100%;padding:4px 8px;gap:12px;flex-shrink:0;border:0}.timing-panel[hidden]{display:none!important}.timing-control{grid-template-columns:auto 40px minmax(70px,1fr);gap:4px;flex:1;font-size:10px}.timing-control input{min-width:70px;min-height:28px}
+#stage{overflow:hidden;min-width:0}canvas{touch-action:none}footer{padding:3px 10px;min-height:23px;font-size:11px;flex-shrink:0;white-space:nowrap;overflow:hidden}#message{overflow:hidden;text-overflow:ellipsis}#seedLabel{display:none}.card{padding:16px;max-height:96%;overscroll-behavior:contain;touch-action:pan-y}.card h2{font-size:20px}.card p{font-size:13px;line-height:1.65}#pauseTag{font-size:12px;padding:6px 10px;top:8px}#orientation{display:none;pointer-events:none;position:absolute;bottom:8px;left:50%;transform:translateX(-50%);font-size:11px;color:#8193ac;white-space:nowrap}
+@media(max-width:600px){header{padding:4px 8px}h1{font-size:13px}.stats{gap:6px;font-size:10px}.toolbar{padding:3px 4px;gap:3px}.toolbar>span{display:none}button,select,summary{padding:5px 7px}.card{width:96%}}
+@media(orientation:portrait){#orientation{display:block}}
+@media(orientation:landscape) and (max-height:500px){body{display:block;position:relative;height:var(--app-height,100dvh);padding:0}#stage{position:absolute;inset:0;width:100%;height:100%;min-height:94%;z-index:0}body:has(#overlay:not([hidden])) #stage{z-index:10}header{position:absolute;z-index:3;top:0;left:0;right:58px;min-height:32px;padding:3px 8px;border:0;background:linear-gradient(#07101ee8,#07101e99,transparent);pointer-events:none}.stats{padding:3px 6px;border-radius:7px;background:#07101ecc;text-shadow:0 1px 2px #000}.toolbar{position:absolute;z-index:4;right:max(4px,env(safe-area-inset-right));left:auto;top:50%;bottom:auto;transform:translateY(-50%);display:flex;flex-direction:column;width:50px;max-width:50px;padding:3px;gap:2px;border:1px solid #30415acc;border-radius:10px;background:#07101ed9;overflow:visible}.toolbar>span{display:none}.toolbar button,.toolbar summary{width:44px;min-width:44px;min-height:44px;padding:4px 3px}.toolbar #more{margin:0}.more-panel{top:50%;bottom:auto;right:calc(100% + 5px);transform:translateY(-50%)}.timing-wrap{position:absolute;z-index:4;left:6px;bottom:5px;width:260px;display:flex;flex-direction:column;align-items:flex-start;gap:2px;border:0;background:transparent}.timing-wrap #timingToggle{min-width:86px;min-height:44px;margin:0;padding:4px 8px;border-color:#30415acc;background:#07101ed9}.timing-panel{position:static;width:260px;display:flex;flex-direction:column;gap:1px;padding:4px 7px;border:1px solid #30415acc;border-radius:8px;background:#07101ed9}.timing-control{width:100%;grid-template-columns:48px 36px 1fr}.timing-control input{min-height:22px}footer{position:absolute;z-index:3;top:33px;left:5px;right:auto;max-width:calc(100% - 70px);min-height:0;padding:3px 7px;border-radius:6px;background:#07101ebd;pointer-events:none}#stage .card{max-height:94%;padding:12px 18px}.card h2{font-size:20px;margin-bottom:5px}.card p{margin:6px 0;line-height:1.45}.start-actions{margin-top:8px;gap:7px}.start-actions button{min-height:44px;font-size:14px}#orientation{display:none}}
+</style>
+<header><div><h1>红环战争</h1><small>RED RING / ORBITAL CONFLICT</small></div><div class="stats"><span class="blue" id="blueStat"></span><span class="white" id="whiteStat"></span><span id="clock">00:00</span></div></header>
+<div class="toolbar"><button id="pause">暂停</button><button id="fullscreen">全屏</button><details id="more"><summary aria-label="更多游戏控制">更多</summary><div class="more-panel"><button id="restart">重开</button><button id="new">新地图</button><select id="difficulty" aria-label="游戏难度"><option value="easy" selected>简单</option><option value="standard">中等</option><option value="hard">困难</option></select><button id="sound" aria-pressed="false">音效：关</button><button id="help">帮助</button></div></details></div>
+<main id="stage"><canvas id="battle" aria-label="红环战争战场：轻点蓝环选起点，再轻点任意其他环下令；每两次轻点一组"></canvas><input id="mapScroll" class="map-scroll" type="range" min="0" max="0" step="1" value="0" aria-label="困难地图横向滚轴" hidden><span id="orientation">建议横屏 · 点蓝环，再点目标</span><div id="pauseTag" hidden>战局暂停 · 空格继续</div><div id="overlay" class="overlay"><div class="card" id="card"><div class="eyebrow">RED RING</div><h2>红环战争</h2><p>蓝方对抗白方 AI。战局在你点击开始前完全静止。</p><p><strong>建议横屏、全屏游戏</strong></p><div class="start-actions"><button id="startGame" type="button">开始游戏</button><button id="startHelp" type="button">游戏说明</button></div></div></div></main>
+<footer><span id="message" role="status" aria-live="polite">电脑：左键起源 · 右键目标 · 左键双击停止输送 · 留 1 球守家</span><span id="seedLabel"></span></footer>
+<script id="game-ui">
+'use strict';
+(() => {
+const {Game,CONFIG,TIMING_OPTIONS}=RedRingCore,$=id=>document.getElementById(id);
+const canvas=$('battle'),ctx=canvas.getContext('2d'),mapScroll=$('mapScroll');
+let game,selected=null,hover=null,pointer=null,scale=1,ox=0,oy=0,cw=1,ch=1,cameraX=0,last=0,acc=0,hudClock=0;
+let muted=true,audio=null,helpOpen=false,resumeHelp=false,gameStarted=false,gameOverShown=false,seenEvents=new WeakSet(),effects=[],visualTime=0;
+const colors={blue:'#65caff',white:'#eff5ff',neutral:'#65738d'};
+function tell(s){$('message').textContent=s;}
+function seed(){return String(Date.now())+'-'+Math.floor(crypto.getRandomValues(new Uint32Array(1))[0]/1000);}
+function showStart(){game.pause(true);helpOpen=false;$('overlay').hidden=false;$('card').className='card';$('card').innerHTML='<div class="eyebrow">RED RING</div><h2>红环战争</h2><p>蓝方对抗白方 AI。战局在你点击开始前完全静止。</p><p><strong>建议横屏、全屏游戏</strong></p><div class="start-actions"><button id="startGame" type="button">开始游戏</button><button id="startHelp" type="button">游戏说明</button></div>';$('startGame').onclick=startBattle;$('startHelp').onclick=openHelp;}
+function enterStartDisplayMode(){try{const fs=!document.fullscreenElement&&document.documentElement.requestFullscreen?document.documentElement.requestFullscreen():null;if(fs&&fs.catch)fs.catch(()=>{});}catch(e){}try{const locked=screen.orientation&&screen.orientation.lock?screen.orientation.lock('landscape'):null;if(locked&&locked.catch)locked.catch(()=>{});}catch(e){}}
+function startBattle(){gameStarted=true;$('overlay').hidden=true;pause(false);last=0;tell('战局开始 · 电脑左键选起源环，右键选目标环');enterStartDisplayMode();}
+function newGame(s=seed(),d=$('difficulty').value){if(!CONFIG.difficulties[d])d='easy';const production=game?.productionInterval??CONFIG.productionInterval,launch=game?.launchInterval??CONFIG.launchInterval;game=new Game(s,d);game.setTiming('production',production);game.setTiming('launch',launch);$('difficulty').value=d;selected=null;hover=null;effects=[];seenEvents=new WeakSet();helpOpen=false;gameOverShown=false;acc=0;$('overlay').hidden=true;setRatio(.5);setCamera(cameraMax());tell('电脑：左键选择有蓝色小球的红环 · 右键选择目标红环');if(!gameStarted)showStart();updateHUD();return game.snapshot();}
+function setRatio(r){if(![.25,.5,1].includes(r))return false;game.ratio=r;$('fullscreen').onclick=async()=>{
+ try{
+  if(document.fullscreenElement){await document.exitFullscreen();return;}
+  if(!document.documentElement.requestFullscreen){tell('此浏览器不支持全屏，可用 Safari 分享→添加到主屏幕，或横屏游玩');return;}
+  await document.documentElement.requestFullscreen();
+ }catch(e){tell('无法进入全屏，请尝试横屏或添加到主屏幕');}
+};
+document.addEventListener('contextmenu',e=>e.preventDefault());
+document.addEventListener('dblclick',e=>e.preventDefault());
+$('more').addEventListener('click',e=>{if(e.target.tagName==='BUTTON')$('more').open=false;});
+document.querySelectorAll('[data-ratio]').forEach(b=>{b.classList.toggle('active',Number(b.dataset.ratio)===r);b.setAttribute('aria-pressed',Number(b.dataset.ratio)===r);});return true;}
+function setTiming(kind,index){const value=TIMING_OPTIONS[Number(index)];if(value===undefined||!game.setTiming(kind,value))return false;updateHUD();return true;}
+function cameraMax(){return Math.max(0,(game?.worldWidth||CONFIG.width)-CONFIG.width);}
+function setCamera(value){const max=cameraMax();cameraX=Math.max(0,Math.min(max,Number(value)||0));mapScroll.max=String(max);mapScroll.value=String(cameraX);mapScroll.hidden=max<=0;return {x:cameraX,max,visible:!mapScroll.hidden};}
+function routeVisible(team){return !(team==='white'&&game?.difficulty==='hard');}
+function pause(value=game.state==='running'){game.pause(value);acc=0;updateHUD();return game.state;}
+function order(s,t,r=game.ratio){const result=game.issueOrder(s,t,r);tell(result.ok?'持续输送已设定 · 已派出 '+result.sent+' 球 → 节点 '+(t+1):result.reason);if(result.ok)tone(420,.045);updateHUD();return result;}
+function stopSource(id){const result=game.stopRoute(id,'blue');if(!result.ok){tell(result.reason);return result;}selected=null;tell('已立即停止该红环发送 · 已取消 '+result.cancelled+' 个待发球 · 在途球继续');updateHUD();return result;}
+function tone(freq,duration){if(muted||!audio)return;try{const o=audio.createOscillator(),g=audio.createGain();o.type='sine';o.frequency.setValueAtTime(freq,audio.currentTime);o.frequency.exponentialRampToValueAtTime(freq*.55,audio.currentTime+duration);g.gain.setValueAtTime(.055,audio.currentTime);g.gain.exponentialRampToValueAtTime(.001,audio.currentTime+duration);o.connect(g);g.connect(audio.destination);o.start();o.stop(audio.currentTime+duration);}catch(e){}}
+function resize(){const box=canvas.getBoundingClientRect();cw=Math.max(1,box.width);ch=Math.max(1,box.height);const dpr=Math.min(devicePixelRatio||1,2);canvas.width=Math.round(cw*dpr);canvas.height=Math.round(ch*dpr);const compact=matchMedia('(orientation:landscape) and (max-height:500px)').matches,rightRail=compact?58:0,usableW=Math.max(1,cw-rightRail);scale=Math.min(usableW/CONFIG.width,ch/CONFIG.height);ox=(usableW-CONFIG.width*scale)/2;oy=(ch-CONFIG.height*scale)/2;ctx.setTransform(dpr,0,0,dpr,0,0);}
+function circle(x,y,r,color,width=1,fill=false){ctx.beginPath();ctx.arc(x,y,Math.max(0,r),0,Math.PI*2);ctx[fill?'fillStyle':'strokeStyle']=color;ctx.lineWidth=width;fill?ctx.fill():ctx.stroke();}
+function line(x,y,xx,yy,color,width=1){ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(xx,yy);ctx.strokeStyle=color;ctx.lineWidth=width;ctx.stroke();}
+function nodeLabel(id){const n=game.nodes.find(n=>n.id===id);return n?`${n.units}/${n.capacity}`:null;}
+function draw(){
+ctx.clearRect(0,0,cw,ch);const bg=ctx.createRadialGradient(cw*.55,ch*.45,10,cw*.5,ch*.5,Math.max(cw,ch)*.8);bg.addColorStop(0,'#14213a');bg.addColorStop(.55,'#0a1427');bg.addColorStop(1,'#050b17');ctx.fillStyle=bg;ctx.fillRect(0,0,cw,ch);
+ctx.save();ctx.translate(ox-cameraX*scale,oy);ctx.scale(scale,scale);ctx.beginPath();ctx.rect(cameraX,0,CONFIG.width,CONFIG.height);ctx.clip();
+for(let x=0;x<=game.worldWidth;x+=40)line(x,0,x,860,'#28436638');for(let y=0;y<=860;y+=40)line(0,y,game.worldWidth,y,'#28436638');
+for(let i=0;i<Math.ceil(90*game.worldWidth/1440);i++){let x=(i*317+43)%game.worldWidth,y=(i*191+87)%860;circle(x,y,i%3===0?1.2:.6,'#8bb5d02b',1,true);}
+const src=game.nodes.find(n=>n.id===selected);
+for(const source of game.nodes){
+ const target=game.nodes.find(n=>n.id===source.routeTargetId);
+ if(!source.owner||!target||source===target||!routeVisible(source.owner))continue;
+ const a=Math.atan2(target.y-source.y,target.x-source.x),ux=Math.cos(a),uy=Math.sin(a);
+ const sx=source.x+ux*(source.r+10),sy=source.y+uy*(source.r+10);
+ const ex=target.x-ux*(target.r+16),ey=target.y-uy*(target.r+16);
+ const c=colors[source.owner]+(source.id===selected?'ee':'66');
+ ctx.setLineDash([5,8]);ctx.lineDashOffset=-visualTime*12;
+ line(sx,sy,ex,ey,c,source.id===selected?1.8:1);ctx.setLineDash([]);
+ line(ex,ey,ex-Math.cos(a-.45)*11,ey-Math.sin(a-.45)*11,c,1.5);
+ line(ex,ey,ex-Math.cos(a+.45)*11,ey-Math.sin(a+.45)*11,c,1.5);
+}
+if(src&&src.owner==='blue'){
+ const target=game.nodes.find(n=>n.id===hover);const end=target||pointer;
+ circle(src.x,src.y,src.r+13+Math.sin(visualTime*3)*3,'#65caff99',2);
+ if(end&&end!==src){ctx.setLineDash([8,10]);ctx.lineDashOffset=-visualTime*26;line(src.x,src.y,end.x,end.y,'#65caff99',2);ctx.setLineDash([]);const a=Math.atan2(end.y-src.y,end.x-src.x),rr=target?target.r+15:0,ex=end.x-Math.cos(a)*rr,ey=end.y-Math.sin(a)*rr;line(ex,ey,ex-Math.cos(a-.45)*15,ey-Math.sin(a-.45)*15,'#65caff',2);line(ex,ey,ex-Math.cos(a+.45)*15,ey-Math.sin(a+.45)*15,'#65caff',2);}
+}
+for(const n of game.nodes){
+ const c=colors[n.owner]||colors.neutral;
+ ctx.shadowColor='#ff275d';ctx.shadowBlur=12;circle(n.x,n.y,n.r,'#ff3768',2.3);ctx.shadowBlur=0;
+ circle(n.x,n.y,n.r-7,'#ff37681b',1);
+ if(n.id===hover)circle(n.x,n.y,n.r+8,'#acddff77',1);
+ for(let j=0;j<n.capacity;j++){const a=j/n.capacity*Math.PI*2+game.time*.12;circle(n.x+Math.cos(a)*n.r,n.y+Math.sin(a)*n.r,j<n.units?4.5:1.5,j<n.units?c:'#773c56',1,true);}
+ for(const team of ['blue','white'])for(let j=0;j<n.attackers[team];j++){const a=game.time*.5+j*.32+(team==='blue'?0:Math.PI);circle(n.x+Math.cos(a)*(n.r+19),n.y+Math.sin(a)*(n.r+19),4,colors[team],1,true);}
+ ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle=n.owner?c:'#8291aa';ctx.font='600 '+Math.max(22,11/scale)+'px system-ui';ctx.fillText(nodeLabel(n.id),n.x,n.y);ctx.font='10px system-ui';ctx.fillStyle='#8594ad';ctx.fillText('N'+String(n.id+1).padStart(2,'0'),n.x,n.y+23);
+}
+for(const u of game.mobile){if(u.reserved===true)continue;const c=colors[u.team];
+ const x=u.sx+(u.tx-u.sx)*u.progress,y=u.sy+(u.ty-u.sy)*u.progress;const back=Math.max(0,u.progress-24/u.distance);line(u.sx+(u.tx-u.sx)*back,u.sy+(u.ty-u.sy)*back,x,y,c+'55',3);ctx.shadowColor=c;ctx.shadowBlur=9;circle(x,y,4.1,c,1,true);ctx.shadowBlur=0;
+}
+for(const e of effects){const age=game.time-e.time;if(e.type==='midair'){if(age<0||age>.45)continue;ctx.globalAlpha=Math.max(0,1-age/.45);for(let j=0;j<6;j++){const a=j*Math.PI/3,travel=4+age*32;line(e.x+Math.cos(a)*travel,e.y+Math.sin(a)*travel,e.x+Math.cos(a)*(travel+4),e.y+Math.sin(a)*(travel+4),colors[j%2?'white':'blue'],1.5);}ctx.globalAlpha=1;continue;}if(age<0||age>1.4)continue;ctx.globalAlpha=Math.max(0,1-age/1.4);circle(e.x,e.y,e.r+age*(e.type==='capture'?85:45),e.type==='capture'?colors[e.team]:'#ff3768',e.type==='capture'?3:1.5);if(e.type==='capture')circle(e.x,e.y,e.r+age*45,colors[e.team],1);ctx.globalAlpha=1;}
+ctx.restore();
+}
+function outcomeText(){return game.winner==='blue'?'蓝方胜利':game.winner==='white'?'白方胜利':'双方平局';}
+function beginEndedMatch(nextSeed,nextDifficulty,message){gameStarted=true;newGame(nextSeed,nextDifficulty);pause(false);last=0;tell(message);}
+function exitEndedGame(){try{window.close();}catch(e){}if(!window.closed){game.state='ended';$('card').className='card';$('card').innerHTML='<div class="eyebrow">SESSION CLOSED</div><h2>已退出游戏</h2><p>浏览器阻止了自动关闭，请关闭页面。</p><button id="exitGame" type="button" disabled>退出游戏</button>';}}
+function showGameOver(){gameOverShown=true;$('overlay').hidden=false;const oldSeed=game.seed,oldDifficulty=game.difficulty,order=['easy','standard','hard'],nextDifficulty=order[Math.min(order.length-1,order.indexOf(oldDifficulty)+1)];const word=game.winner==='blue'?'胜利':game.winner==='white'?'失败':'平局',kind=game.winner==='blue'?'victory':game.winner==='white'?'defeat':'draw';$('card').className='card outcome-card';$('card').innerHTML='<div class="eyebrow">CONFLICT RESOLVED</div><h2 class="outcome-impact '+kind+'">'+word+'</h2><p class="outcome-subtitle">游戏结束</p><div class="outcome-actions"><button id="nextLevel" type="button">下一关</button><button id="replayLevel" type="button">重玩此关</button><button id="increaseDifficulty" type="button"'+(oldDifficulty==='hard'?' disabled':'')+'>'+(oldDifficulty==='hard'?'已是最高难度':'增加难度')+'</button><button id="exitGame" type="button">退出</button></div>';$('nextLevel').onclick=()=>beginEndedMatch(seed(),oldDifficulty,'下一关 · 新地图已开始');$('replayLevel').onclick=()=>beginEndedMatch(oldSeed,oldDifficulty,'本关已重新开始');$('increaseDifficulty').onclick=()=>{if(oldDifficulty!=='hard')beginEndedMatch(oldSeed,nextDifficulty,'难度已提升至 '+(nextDifficulty==='hard'?'困难':'中等'));};$('exitGame').onclick=exitEndedGame;tone(game.winner==='blue'?720:game.winner==='white'?160:420,.4);}
+function updateHUD(){const t=game.totals();$('blueStat').textContent='蓝方 '+t.blue.nodes+' 环 / '+t.blue.total+' 球';$('whiteStat').textContent='白方 '+t.white.nodes+' 环 / '+t.white.total+' 球';$('clock').textContent=String(Math.floor(game.time/60)).padStart(2,'0')+':'+String(Math.floor(game.time%60)).padStart(2,'0');$('seedLabel').textContent='地图 '+game.seed;$('pause').textContent=game.state==='paused'?'继续':'暂停';$('pause').disabled=game.state==='ended';$('pauseTag').hidden=game.state!=='paused'||helpOpen;
+ if(game.state==='ended'&&!helpOpen&&!gameOverShown)showGameOver();}
+function frame(now){const dt=last?Math.min((now-last)/1000,CONFIG.maxFrameDelta):0;last=now;visualTime+=dt;if(game.state==='running'){acc+=dt;while(acc>=CONFIG.fixedStep){game.step(CONFIG.fixedStep);acc-=CONFIG.fixedStep;}}else acc=0;
+for(const e of game.events)if(!seenEvents.has(e)){seenEvents.add(e);effects.push(e);tone(e.type==='capture'?620:180,.07);}effects=effects.filter(e=>game.time-e.time<1.4);if(selected!==null&&game.nodes[selected].owner!=='blue')selected=null;draw();hudClock+=dt;if(hudClock>.1){updateHUD();hudClock=0;}requestAnimationFrame(frame);}
+function locate(e){const r=canvas.getBoundingClientRect();pointer={x:(e.clientX-r.left-ox)/scale+cameraX,y:(e.clientY-r.top-oy)/scale};const n=game.nodes.filter(n=>Math.hypot(pointer.x-n.x,pointer.y-n.y)<=Math.max(n.r+8,22/scale)).sort((a,b)=>Math.hypot(pointer.x-a.x,pointer.y-a.y)-Math.hypot(pointer.x-b.x,pointer.y-b.y))[0];hover=n?n.id:null;return n;}
+canvas.addEventListener('pointermove',locate);canvas.addEventListener('pointerleave',()=>{hover=null;pointer=null;});
+canvas.addEventListener('pointerdown',e=>{
+ e.preventDefault();if(game.state!=='running'||e.button!==0)return;const n=locate(e);if(!n){if(e.pointerType==='mouse'&&selected!==null){selected=null;tell('已取消选择');}return;}
+ if(e.pointerType==='mouse'){
+  if(n.owner!=='blue'){tell(selected===null?'左键只能选择蓝方起源环':'已选起源环 · 请右键目标红环');return;}
+  selected=n.id;tell('已选节点 '+(n.id+1)+' · 右键目标红环下令');return;
+ }
+ if(selected===null){
+  if(n.owner!=='blue'){tell('只能选择蓝方环作为起点');return;}
+  selected=n.id;tell('已选节点 '+(n.id+1)+' · 再点任意其他环下令');return;
+ }
+ if(selected===n.id){stopSource(n.id);return;}
+ const source=selected;selected=null;order(source,n.id);
+});
+canvas.addEventListener('click',e=>{
+ if(e.detail!==2||e.button!==0||game.state!=='running')return;
+ const n=locate(e);if(n&&n.owner==='blue')stopSource(n.id);
+});
+canvas.addEventListener('contextmenu',e=>{
+ e.preventDefault();if(game.state!=='running')return;const n=locate(e);if(!n){if(selected!==null){selected=null;tell('已取消选择');}return;}
+ if(selected===null){tell('请先左键选择蓝方起源环');return;}
+ if(selected===n.id){tell('目标不能与起源环相同 · 左键双击可停止输送');return;}
+ const source=selected;selected=null;order(source,n.id);
+});
+canvas.addEventListener('dblclick',e=>{
+ e.preventDefault();
+});
+mapScroll.oninput=e=>setCamera(e.target.value);$('stage').addEventListener('wheel',e=>{if(cameraMax()<=0)return;e.preventDefault();setCamera(cameraX+(Math.abs(e.deltaX)>Math.abs(e.deltaY)?e.deltaX:e.deltaY));},{passive:false});
+$('pause').onclick=()=>pause();$('restart').onclick=()=>newGame(game.seed);$('new').onclick=()=>newGame();$('difficulty').onchange=()=>{game.difficulty=$('difficulty').value;tell('难度已即时切换，双方生产速度不变');};$('sound').onclick=()=>{try{if(!audio)audio=new (window.AudioContext||window.webkitAudioContext)();audio.resume();muted=!muted;$('sound').textContent='音效：'+(muted?'关':'开');$('sound').setAttribute('aria-pressed',!muted);tone(520,.1);}catch(e){tell('此浏览器不支持音效，游戏仍可正常运行');}};
+function closeHelp(){helpOpen=false;if(!gameStarted){showStart();updateHUD();return;}$('overlay').hidden=true;if(resumeHelp)pause(false);updateHUD();}
+function openHelp(){if(helpOpen){closeHelp();return;}resumeHelp=gameStarted&&game.state==='running';pause(true);helpOpen=true;$('pauseTag').hidden=true;$('overlay').hidden=false;$('card').className='card help-card';$('card').innerHTML='<div class="eyebrow">QUICK GUIDE</div><h2>游戏说明</h2><ul class="help-list"><li><strong>游戏目标：</strong>指挥你的蓝色小球占领所有红环。</li><li><strong>手机端：</strong>先选择有蓝色小球的红环，再选择目标红环。</li><li><strong>电脑端：</strong>左键选择有蓝色小球的红环，右键选择目标红环。</li><li><strong>生产：</strong>红环上的蓝色小球大于3个时会自动生产。</li><li><strong>休养：</strong>双击红环会停止发射，同时加快小球的产生速度。</li></ul><button id="closeHelp">返回'+(gameStarted?'战场':'开始页')+'</button>';$('closeHelp').onclick=closeHelp;$('closeHelp').focus();}
+$('help').onclick=openHelp;
+window.addEventListener('keydown',e=>{if(['SELECT','INPUT','TEXTAREA','BUTTON'].includes(e.target.tagName)&&e.key!=='Escape')return;if(e.key==='Escape'){if(helpOpen)closeHelp();selected=null;return;}if(helpOpen)return;if(e.code==='Space'){e.preventDefault();pause();}});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&game.state==='running')pause(true);last=0;});
+window.__GAME_DEBUG__={selectedId:()=>selected,nodeLabel,snapshot:()=>game.snapshot(),newGame,pause,issueOrder:order,setRatio,setTiming,timingOptions:()=>[...TIMING_OPTIONS],camera:()=>({x:cameraX,max:cameraMax(),visible:!mapScroll.hidden}),setCamera,routeVisible,setAI:enabled=>{game.aiEnabled=Boolean(enabled);return game.aiEnabled;},step:seconds=>{if(!Number.isFinite(seconds)||seconds<0||seconds>600)throw new Error('seconds must be 0..600');for(let t=0;t<seconds;t+=CONFIG.fixedStep)game.step(Math.min(CONFIG.fixedStep,seconds-t));updateHUD();return game.snapshot();},select:id=>{selected=game.nodes.find(n=>n.id===id&&n.owner==='blue')?.id??null;return selected;},screenPosition:id=>{const n=game.nodes.find(n=>n.id===id);if(!n)return null;const r=canvas.getBoundingClientRect();return {x:r.left+ox+(n.x-cameraX)*scale,y:r.top+oy+n.y*scale};},gameOverView:()=>gameOverShown?(document.getElementById('nextLevel')?'actions':'exited'):'hidden',testVictory:team=>{if(team!==null&&!['blue','white','draw'].includes(team))throw new Error('invalid team');game.nodes.forEach(n=>{n.owner=team==='draw'||team===null?null:team;n.units=team==='draw'||team===null?0:1;n.routeTargetId=null;n.attackers={blue:0,white:0};});game.mobile=[];game.checkVictory();updateHUD();return game.snapshot();}};
+function syncAppHeight(){document.documentElement.style.setProperty('--app-height',(window.visualViewport?.height||window.innerHeight)+'px');resize();}newGame();new ResizeObserver(resize).observe($('stage'));window.visualViewport?.addEventListener('resize',syncAppHeight);window.addEventListener('orientationchange',syncAppHeight);syncAppHeight();requestAnimationFrame(frame);
+})();
+</script>
+<script>
+if (/^https?:$/.test(location.protocol) && 'serviceWorker' in navigator) {
+ window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {
+  document.getElementById('message').textContent='离线缓存不可用；当前仍可游玩，安装请使用 HTTPS';
+ }));
+}
+</script></body></html>
